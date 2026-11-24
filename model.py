@@ -6,9 +6,61 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class RotaryEmbedding(nn.Module):
+    """Rotary Position Embeddings (RoPE) per codificare distanze relative senza inquinare token_emb."""
+
+    def __init__(self, dim: int, max_len: int = 512, base: float = 10000.0):
+        super().__init__()
+        assert dim % 2 == 0, "d_head deve essere pari per RoPE"
+        self.dim = dim
+        self.base = base
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._build_cache(max_len)
+
+    def _build_cache(self, max_len: int):
+        t = torch.arange(max_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)  # (max_len, dim/2)
+        emb = torch.cat((freqs, freqs), dim=-1)  # (max_len, dim)
+        self.register_buffer(
+            "cos_cached", emb.cos()[None, None, :, :], persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", emb.sin()[None, None, :, :], persistent=False
+        )
+
+    def forward(self, seq_len: int, dtype: torch.dtype, device: torch.device):
+        if seq_len > self.cos_cached.size(2):
+            self._build_cache(seq_len)
+        return (
+            self.cos_cached[:, :, :seq_len, :].to(device=device, dtype=dtype),
+            self.sin_cached[:, :, :seq_len, :].to(device=device, dtype=dtype),
+        )
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rope(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q_rot = (q * cos) + (rotate_half(q) * sin)
+    k_rot = (k * cos) + (rotate_half(k) * sin)
+    return q_rot, k_rot
+
+
 class MultiHeadSelfAttention(nn.Module):
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        max_len: int = 320,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         assert d_model % n_heads == 0, "d_model deve essere divisibile per n_heads"
         self.d_model = d_model
@@ -17,6 +69,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         self.qkv_proj = nn.Linear(d_model, 3 * d_model)
         self.out_proj = nn.Linear(d_model, d_model)
+        self.rope = RotaryEmbedding(self.d_head, max_len=max_len)
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
@@ -36,8 +89,11 @@ class MultiHeadSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
+        # Applica RoPE solo a Q e K (non a V)
+        cos, sin = self.rope(T, dtype=q.dtype, device=q.device)
+        q, k = apply_rope(q, k, cos, sin)
+
         if not return_attention:
-            # Percorso veloce SDPA / FlashAttention nativo di PyTorch
             sdpa_mask = (
                 (attention_mask == 1).unsqueeze(1).unsqueeze(2)
                 if attention_mask is not None
@@ -67,14 +123,21 @@ class MultiHeadSelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Blocco Transformer Pre-LN standard."""
+    """Blocco Transformer Pre-LN standard con RoPE."""
 
     def __init__(
-        self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.1
+        self,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        max_len: int = 320,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
-        self.attn = MultiHeadSelfAttention(d_model, n_heads, dropout=dropout)
+        self.attn = MultiHeadSelfAttention(
+            d_model, n_heads, max_len=max_len, dropout=dropout
+        )
         self.ln2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -111,7 +174,7 @@ class LogicTransformer(nn.Module):
         n_layers: int = 8,
         d_ff: int = 1024,
         num_classes: int = 3,
-        dropout: float = 0.1,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -119,12 +182,14 @@ class LogicTransformer(nn.Module):
         self.d_model = d_model
         self.n_layers = n_layers
 
+        # Nessun pos_emb assoluto: usiamo RoPE in ogni layer
         self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_len, d_model)
         self.emb_dropout = nn.Dropout(dropout)
 
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, n_heads, d_ff, dropout=dropout)
+            TransformerBlock(
+                d_model, n_heads, d_ff, max_len=max_len, dropout=dropout
+            )
             for _ in range(n_layers)
         ])
 
@@ -134,6 +199,7 @@ class LogicTransformer(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        resid_std = 0.02 / math.sqrt(2 * self.n_layers)
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
@@ -145,11 +211,13 @@ class LogicTransformer(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
+        # Scala i pesi di uscita residui per stabilizzare reti profonde from-scratch
+        for layer in self.layers:
+            nn.init.normal_(layer.attn.out_proj.weight, mean=0.0, std=resid_std)
+            nn.init.normal_(layer.ffn[3].weight, mean=0.0, std=resid_std)
+
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
-        B, T = input_ids.shape
-        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
-        x = self.token_emb(input_ids) + self.pos_emb(pos)
-        return self.emb_dropout(x)
+        return self.emb_dropout(self.token_emb(input_ids))
 
     def forward(
         self,
