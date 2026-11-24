@@ -28,7 +28,7 @@ class MultiHeadSelfAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         B, T, D = x.shape
 
-        qkv = self.qkv_proj(x)  # (B, T, 3*D)
+        qkv = self.qkv_proj(x)
         q, k, v = qkv.chunk(3, dim=-1)
 
         # (B, n_heads, T, d_head)
@@ -36,21 +36,34 @@ class MultiHeadSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
+        if not return_attention:
+            # Percorso veloce SDPA / FlashAttention nativo di PyTorch
+            sdpa_mask = (
+                (attention_mask == 1).unsqueeze(1).unsqueeze(2)
+                if attention_mask is not None
+                else None
+            )
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=sdpa_mask,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+            )
+            attn_probs = None
+        else:
+            scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_head)
+            if attention_mask is not None:
+                key_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2)
+                scores = scores.masked_fill(key_mask, torch.finfo(scores.dtype).min)
+            attn_probs = F.softmax(scores, dim=-1)
+            attn_dropped = self.attn_dropout(attn_probs)
+            out = torch.matmul(attn_dropped, v)
 
-        if attention_mask is not None:
-            # attention_mask: (B, T) con 1=valido, 0=PAD
-            key_mask = (attention_mask == 0).unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
-            scores = scores.masked_fill(key_mask, torch.finfo(scores.dtype).min)
-
-        attn_probs = F.softmax(scores, dim=-1)
-        attn_dropped = self.attn_dropout(attn_probs)
-
-        out = torch.matmul(attn_dropped, v)  # (B, n_heads, T, d_head)
         out = out.transpose(1, 2).contiguous().view(B, T, D)
         out = self.resid_dropout(self.out_proj(out))
 
-        return out, (attn_probs if return_attention else None)
+        return out, attn_probs
 
 
 class TransformerBlock(nn.Module):
@@ -134,7 +147,7 @@ class LogicTransformer(nn.Module):
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         B, T = input_ids.shape
-        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)  # (1, T)
+        pos = torch.arange(T, device=input_ids.device).unsqueeze(0)
         x = self.token_emb(input_ids) + self.pos_emb(pos)
         return self.emb_dropout(x)
 
@@ -162,12 +175,11 @@ class LogicTransformer(nn.Module):
                 attentions.append(attn_probs)
 
         x_norm = self.final_ln(x)
-        cls_repr = x_norm[:, 0, :]  # Token [CLS] in posizione 0
+        cls_repr = x_norm[:, 0, :]
         logits = self.classifier(cls_repr)
 
         out: Dict[str, object] = {"logits": logits}
         if return_hidden_states:
-            # hidden_states[0] = embedding; hidden_states[l] = output del layer l (1..n_layers)
             out["hidden_states"] = hidden_states
         if return_attentions:
             out["attentions"] = attentions
@@ -179,7 +191,6 @@ class LogicTransformer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         start_layer: int = 4,
     ) -> torch.Tensor:
-        """Utile per Model Stitching e Activation Patching: riparte dal layer `start_layer` (0-indexed)."""
         x = hidden
         for layer in self.layers[start_layer:]:
             x, _ = layer(x, attention_mask=attention_mask, return_attention=False)
@@ -192,7 +203,6 @@ def count_parameters(model: nn.Module) -> int:
 
 
 if __name__ == "__main__":
-    # Sanity check veloce su CPU
     model = LogicTransformer()
     print(f"Parametri totali: {count_parameters(model):,}")
 
@@ -200,9 +210,10 @@ if __name__ == "__main__":
     B, T = 4, 64
     dummy_ids = torch.randint(0, 66, (B, T))
     dummy_mask = torch.ones((B, T), dtype=torch.long)
-    dummy_mask[:, -10:] = 0  # Simula padding
+    dummy_mask[:, -10:] = 0
 
     with torch.no_grad():
+        out_fast = model(dummy_ids, dummy_mask, return_attentions=False)
         out = model(
             dummy_ids,
             dummy_mask,
@@ -213,13 +224,14 @@ if __name__ == "__main__":
         h_states = out["hidden_states"]
         attns = out["attentions"]
 
-        # Verifica che forward_from_layer(h_states[4], start_layer=4) dia lo stesso identico risultato!
         stitched_logits = model.forward_from_layer(
             h_states[4], dummy_mask, start_layer=4
         )
         diff = (logits - stitched_logits).abs().max().item()
+        sdpa_diff = (logits - out_fast["logits"]).abs().max().item()
 
     print(f"Logits shape: {logits.shape}")
     print(f"Numero hidden states: {len(h_states)} (emb + {model.n_layers} layers)")
     print(f"Attentions shape (layer 0): {attns[0].shape}")
     print(f"Differenza max forward vs forward_from_layer(4): {diff:.2e}")
+    print(f"Differenza max SDPA vs Manuale: {sdpa_diff:.2e}")

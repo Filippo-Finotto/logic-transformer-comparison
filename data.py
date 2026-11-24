@@ -115,7 +115,8 @@ class ProofWriterTokenizer:
         t_tokens = self.tokenize_text(theory)
         q_tokens = self.tokenize_text(question)
 
-        tokens = ["[CLS]"] + t_tokens + ["[SEP]"] + q_tokens + ["[SEP]"]
+        # Domanda fissa davanti, subito dopo [CLS], per facilitare la ricerca nella teoria
+        tokens = ["[CLS]"] + q_tokens + ["[SEP]"] + t_tokens + ["[SEP]"]
         truncated = len(tokens) > max_len
         tokens = tokens[:max_len]
 

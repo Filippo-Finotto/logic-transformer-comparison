@@ -10,12 +10,11 @@ from typing import Dict, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Sampler, Subset
 
 from data import (
     AlphaPermutator,
     ID_TO_LABEL,
-    ProofWriterTokenizer,
     build_datasets,
 )
 from model import LogicTransformer, count_parameters
@@ -28,8 +27,49 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+class LengthBucketBatchSampler(Sampler[List[int]]):
+    """Raggruppa esempi di lunghezza simile per ridurre gli sprechi sul padding mantenendo stocasticità."""
+
+    def __init__(self, lengths: List[int], batch_size: int, seed: int = 42):
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        indices = list(range(len(self.lengths)))
+        rng.shuffle(indices)
+
+        # Ordina per lunghezza dentro mega-blocchi da 25 batch
+        pool_size = self.batch_size * 25
+        batches = []
+        for i in range(0, len(indices), pool_size):
+            pool = indices[i : i + pool_size]
+            pool.sort(key=lambda idx: self.lengths[idx])
+            for j in range(0, len(pool), self.batch_size):
+                batches.append(pool[j : j + self.batch_size])
+
+        rng.shuffle(batches)
+        for b in batches:
+            yield b
+
+    def __len__(self) -> int:
+        return (len(self.lengths) + self.batch_size - 1) // self.batch_size
+
+
+def get_dataset_lengths(ds) -> List[int]:
+    if isinstance(ds, Subset):
+        masks = ds.dataset.attention_mask[ds.indices]
+    else:
+        masks = ds.attention_mask
+    return masks.sum(dim=1).tolist()
+
+
 def dynamic_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    """Taglia ogni batch alla lunghezza reale massima nel batch (molto più veloce!)."""
     input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
     attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
     labels = torch.stack([b["label"] for b in batch], dim=0)
@@ -49,20 +89,14 @@ def dynamic_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.
 def compute_cosine_invariance_loss(
     h_x: torch.Tensor, h_px: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
-    """
-    1 - cosine_similarity media su tutti i token non-PAD (calcolata in FP32).
-    h_x, h_px: (B, T, D)
-    attention_mask: (B, T)
-    """
-    cos_sim = F.cosine_similarity(h_x.float(), h_px.float(), dim=-1)  # (B, T)
+    cos_sim = F.cosine_similarity(h_x.float(), h_px.float(), dim=-1)
     mask = attention_mask.float()
-    loss = ((1.0 - cos_sim) * mask).sum() / mask.sum().clamp(min=1.0)
-    return loss
+    return ((1.0 - cos_sim) * mask).sum() / mask.sum().clamp(min=1.0)
 
 
 def load_or_build_datasets(cache_dir: str, data_seed: int = 42):
     os.makedirs(cache_dir, exist_ok=True)
-    cache_path = os.path.join(cache_dir, f"proofwriter_seed{data_seed}.pt")
+    cache_path = os.path.join(cache_dir, f"proofwriter_qfirst_seed{data_seed}.pt")
     if os.path.exists(cache_path):
         print(f"Caricamento dataset da cache: {cache_path}")
         saved = torch.load(cache_path, weights_only=False)
@@ -126,7 +160,7 @@ def evaluate(
         logits = model(input_ids, mask)["logits"]
         preds = logits.argmax(dim=-1)
 
-        matches = (preds == labels)
+        matches = preds == labels
         total += labels.size(0)
         correct += int(matches.sum().item())
 
@@ -141,11 +175,10 @@ def evaluate(
             total_by_cls[lbl] += 1
             correct_by_cls[lbl] += ok
 
-            if lbl in (0, 1):  # False o True (escluso Unknown)
+            if lbl in (0, 1):
                 total_tf_by_qdep[qd] += 1
                 correct_tf_by_qdep[qd] += ok
 
-        # Calcola Flip Rate sotto permutazione simbolica
         for _ in range(n_perm_flips):
             perm_ids = permutator.permute_batch(input_ids, rng)
             perm_preds = model(perm_ids, mask)["logits"].argmax(dim=-1)
@@ -185,9 +218,9 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data_seed", type=int, default=42)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--lambda_inv", type=float, default=1.0)
     parser.add_argument("--inv_layer", type=int, default=4)
@@ -216,7 +249,6 @@ def main():
 
     print(f"=== RUN: {run_name} | device={device} | amp={use_amp} ===")
 
-    # 1. Carica dataset (con data_seed fisso per parità tra modelli)
     tok, train_ds, val_ds, test_id_ds, test_ood_ds = load_or_build_datasets(
         args.cache_dir, data_seed=args.data_seed
     )
@@ -229,37 +261,29 @@ def main():
         test_id_ds = Subset(test_id_ds, list(range(32)))
         test_ood_ds = Subset(test_ood_ds, list(range(32)))
 
-    # 2. Fissa seed PRIMA di creare DataLoader e Modello (identico theta_0!)
     set_seed(args.seed)
     perm_rng = random.Random(args.seed + 1000)
     permutator = AlphaPermutator(tok)
 
+    train_sampler = LengthBucketBatchSampler(
+        get_dataset_lengths(train_ds), batch_size=args.batch_size, seed=args.seed
+    )
     eval_bs = 16 if args.debug else 128
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
+        batch_sampler=train_sampler,
         collate_fn=dynamic_collate_fn,
         pin_memory=(device.type == "cuda"),
     )
     val_loader = DataLoader(
-        val_ds,
-        batch_size=eval_bs,
-        shuffle=False,
-        collate_fn=dynamic_collate_fn,
+        val_ds, batch_size=eval_bs, shuffle=False, collate_fn=dynamic_collate_fn
     )
     test_id_loader = DataLoader(
-        test_id_ds,
-        batch_size=eval_bs,
-        shuffle=False,
-        collate_fn=dynamic_collate_fn,
+        test_id_ds, batch_size=eval_bs, shuffle=False, collate_fn=dynamic_collate_fn
     )
     test_ood_loader = DataLoader(
-        test_ood_ds,
-        batch_size=eval_bs,
-        shuffle=False,
-        collate_fn=dynamic_collate_fn,
+        test_ood_ds, batch_size=eval_bs, shuffle=False, collate_fn=dynamic_collate_fn
     )
 
     model = LogicTransformer(
@@ -279,12 +303,14 @@ def main():
     )
     total_steps = args.epochs * len(train_loader)
     warmup_steps = max(1, int(0.05 * total_steps))
+    min_lr_ratio = 0.05  # Non scende mai sotto il 5% di lr_max
 
     def lr_lambda(step: int):
         if step < warmup_steps:
             return float(step + 1) / float(warmup_steps)
         progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
@@ -292,9 +318,9 @@ def main():
     best_val_acc = -1.0
     history = []
 
-    # 3. Training Loop
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
+        train_sampler.set_epoch(epoch)
         model.train()
 
         sum_ce = 0.0
@@ -316,13 +342,10 @@ def main():
                     loss_ce = F.cross_entropy(logits_x, labels)
                     loss_inv = torch.tensor(0.0, device=device)
                     loss = loss_ce
-
                 else:
-                    # free_aug o constrained: generiamo sigma(x) al volo
                     perm_ids = permutator.permute_batch(input_ids, perm_rng)
-                    need_h = (args.mode == "constrained")
+                    need_h = args.mode == "constrained"
 
-                    # Unico forward concatenato (2*B, T) per massima velocità
                     both_ids = torch.cat([input_ids, perm_ids], dim=0)
                     both_mask = torch.cat([mask, mask], dim=0)
                     out_both = model(
@@ -339,9 +362,7 @@ def main():
                     if args.mode == "constrained":
                         h_layer = out_both["hidden_states"][args.inv_layer]
                         h_x, h_px = h_layer.split(B, dim=0)
-                        loss_inv = compute_cosine_invariance_loss(
-                            h_x, h_px, mask
-                        )
+                        loss_inv = compute_cosine_invariance_loss(h_x, h_px, mask)
                         loss = loss_ce + args.lambda_inv * loss_inv
                     else:
                         loss_inv = torch.tensor(0.0, device=device)
@@ -380,17 +401,27 @@ def main():
             "train_inv": train_inv,
             "train_acc": train_acc,
             "val_acc": val_metrics["accuracy"],
+            "val_acc_cls": val_metrics["acc_by_class"],
             "val_flip_rate": val_metrics["flip_rate"],
             "time_sec": dt,
         }
         history.append(row_log)
 
+        cls_str = (
+            f"T={val_metrics['acc_by_class']['True']:.2f}/"
+            f"F={val_metrics['acc_by_class']['False']:.2f}/"
+            f"U={val_metrics['acc_by_class']['Unknown']:.2f}"
+        )
         print(
             f"Epoch {epoch:02d}/{args.epochs:02d} ({dt:.1f}s) | "
-            f"train_ce={train_ce:.4f} | train_inv={train_inv:.4f} | "
-            f"train_acc={train_acc:.3f} | val_acc={val_metrics['accuracy']:.3f} | "
-            f"val_flip={val_metrics['flip_rate']:.3f}"
+            f"ce={train_ce:.4f} | inv={train_inv:.4f} | "
+            f"tr_acc={train_acc:.3f} | val_acc={val_metrics['accuracy']:.3f} ({cls_str}) | "
+            f"flip={val_metrics['flip_rate']:.3f}"
         )
+
+        # Salva history.json ad ogni epoca (sicuro contro disconnessioni!)
+        with open(os.path.join(out_dir, "history.json"), "w") as f:
+            json.dump(history, f, indent=2)
 
         if val_metrics["accuracy"] > best_val_acc:
             best_val_acc = val_metrics["accuracy"]
@@ -399,15 +430,11 @@ def main():
                 os.path.join(out_dir, "best_model.pt"),
             )
 
-    # Salva anche il modello all'ultimo step T (utile per confronto a budget fisso)
     torch.save(
         {"model_state_dict": model.state_dict(), "epoch": args.epochs},
         os.path.join(out_dir, "last_model.pt"),
     )
-    with open(os.path.join(out_dir, "history.json"), "w") as f:
-        json.dump(history, f, indent=2)
 
-    # 4. Valutazione Finale sul Test ID e Test OOD (usando best_model e last_model)
     eval_all = {}
     for ckpt_tag in ("best_model", "last_model"):
         ckpt = torch.load(
@@ -435,9 +462,9 @@ def main():
     print("\n=== RISULTATI FINALI (best_model) ===")
     b_id = eval_all["best_model"]["test_id"]
     b_ood = eval_all["best_model"]["test_ood"]
-    print(f"Test ID  | Acc={b_id['accuracy']:.4f} | FlipRate={b_id['flip_rate']:.4f}")
+    print(f"Test ID  | Acc={b_id['accuracy']:.4f} | Flip={b_id['flip_rate']:.4f} | Cls={b_id['acc_by_class']}")
     print(f"  per QDep: {b_id['acc_by_qdep']}")
-    print(f"Test OOD | Acc={b_ood['accuracy']:.4f} | FlipRate={b_ood['flip_rate']:.4f}")
+    print(f"Test OOD | Acc={b_ood['accuracy']:.4f} | Flip={b_ood['flip_rate']:.4f} | Cls={b_ood['acc_by_class']}")
     print(f"  True/False per QDep: {b_ood['acc_true_false_by_qdep']}")
 
 
