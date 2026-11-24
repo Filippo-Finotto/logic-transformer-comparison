@@ -607,3 +607,7 @@ def main():
     for k, v in stitching.items():
         print(f"  {k:24s}: {v}")
     print(f"\nReport completo salvato in: {analysis_dir}")
+
+
+if __name__ == "__main__":
+    main()
