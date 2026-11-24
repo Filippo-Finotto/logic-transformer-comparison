@@ -185,12 +185,16 @@ def compute_sentence_invariance_loss(
     repr_px, valid_px = pool_sentences(h_px, sent_ids_px)
 
     s = min(repr_x.size(1), repr_px.size(1))
-    repr_x = repr_x[:, :s, :]
-    repr_px = repr_px[:, :s, :]
-    mask = (valid_x[:, :s] & valid_px[:, :s]).float()
+    mask = valid_x[:, :s] & valid_px[:, :s]
+    if not mask.any():
+        return torch.tensor(0.0, device=h_x.device)
 
-    cos_sim = F.cosine_similarity(repr_x, repr_px, dim=-1)
-    return ((1.0 - cos_sim) * mask).sum() / mask.sum().clamp(min=1.0)
+    vx = repr_x[:, :s, :][mask]
+    vpx = repr_px[:, :s, :][mask]
+    mu = torch.cat([vx, vpx], dim=0).mean(dim=0, keepdim=True)
+
+    cos_centered = F.cosine_similarity(vx - mu, vpx - mu, dim=-1)
+    return (1.0 - cos_centered).mean()
 
 
 @torch.no_grad()
