@@ -46,6 +46,8 @@ def find_models_in_dir(save_dir: str, seed: int = 42) -> Dict[str, str]:
     if not os.path.exists(save_dir):
         return found
     for name in sorted(os.listdir(save_dir)):
+        if "_debug" in name:
+            continue
         path = os.path.join(save_dir, name, "best_model.pt")
         if not os.path.exists(path):
             continue
