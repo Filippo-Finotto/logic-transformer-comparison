@@ -553,10 +553,29 @@ def main():
         probe_qdep_ood[name] = qdep_curve
 
     # 5. Model Stitching (Layer 3 -> Layer 4..6)
+    report = {
+        "models": list(model_specs.keys()),
+        "invariance_curves_id": inv_curves_id,
+        "invariance_curves_ood": inv_curves_ood,
+        "cka_sentence_diag_id": cka_sent_id,
+        "cka_cls_diag_id": cka_cls_id,
+        "cka_sentence_diag_ood": cka_sent_ood,
+        "disagreements": disagreements,
+        "probe_cls_id": probe_cls_id,
+        "probe_qdep_ood": probe_qdep_ood,
+        "stitching_layer3": {},
+    }
+
+    with open(os.path.join(analysis_dir, "analysis_report.json"), "w") as f:
+        json.dump(report, f, indent=2)
+    make_plots(report, analysis_dir)
+    print(f"Report parziale e grafici PNG salvati in: {analysis_dir}")
+
+    # 5. Model Stitching (Layer 3 -> Layer 4..6)
     print("Esecuzione Model Stitching (layer 3)...")
     stitching = {}
-    stitch_train = train_ds.records[:3000]
-    stitch_test = test_id_ds.records[:1000]
+    stitch_train = train_ds.records[:1000]
+    stitch_test = test_id_ds.records[:600]
     for a in trained_names:
         for b in trained_names:
             if a == b:
@@ -570,26 +589,12 @@ def main():
                 hf_tok,
                 device,
                 split_layer=3,
-                adapt_epochs=3,
+                adapt_epochs=2,
             )
 
-    report = {
-        "models": list(model_specs.keys()),
-        "invariance_curves_id": inv_curves_id,
-        "invariance_curves_ood": inv_curves_ood,
-        "cka_sentence_diag_id": cka_sent_id,
-        "cka_cls_diag_id": cka_cls_id,
-        "cka_sentence_diag_ood": cka_sent_ood,
-        "disagreements": disagreements,
-        "probe_cls_id": probe_cls_id,
-        "probe_qdep_ood": probe_qdep_ood,
-        "stitching_layer3": stitching,
-    }
-
+    report["stitching_layer3"] = stitching
     with open(os.path.join(analysis_dir, "analysis_report.json"), "w") as f:
         json.dump(report, f, indent=2)
-
-    make_plots(report, analysis_dir)
 
     print("\n=== RIEPILOGO ANALISI ===")
     print("Invarianza Simbolica ID (L0..L6):")
@@ -601,8 +606,4 @@ def main():
     print("\nModel Stitching (Layer 3):")
     for k, v in stitching.items():
         print(f"  {k:24s}: {v}")
-    print(f"\nReport e grafici PNG salvati in: {analysis_dir}")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"\nReport completo salvato in: {analysis_dir}")
