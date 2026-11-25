@@ -1,12 +1,10 @@
 import argparse
-import copy
 import json
 import os
 import random
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,15 +21,11 @@ from train_hf import (
 
 
 def linear_cka(X: torch.Tensor, Y: torch.Tensor) -> float:
-    """
-    Linear CKA (Kornblith et al., 2019) tra matrici (N, D) in FP64 per precisione.
-    """
     X = X.double()
     Y = Y.double()
     X = X - X.mean(dim=0, keepdim=True)
     Y = Y - Y.mean(dim=0, keepdim=True)
 
-    # ||Y^T X||_F^2 / (||X^T X||_F * ||Y^T Y||_F)
     ytx = Y.t() @ X
     xtx = X.t() @ X
     yty = Y.t() @ Y
@@ -58,7 +52,8 @@ def find_models_in_dir(save_dir: str, seed: int = 42) -> Dict[str, str]:
         elif name.startswith("free_"):
             found["free"] = path
         elif name.startswith("constrained_"):
-            found["constrained"] = path
+            lam_part = name.split("_lam")[-1] if "_lam" in name else name
+            found[f"const_lam{lam_part}"] = path
     return found
 
 
@@ -86,9 +81,8 @@ def extract_features_and_preds(
     perm_seed: int = 777,
     max_sent_keep: int = 12000,
 ) -> Dict[str, object]:
-    """Estrae predizioni, stati [CLS] per tutti i 7 layer (0..6) e stati delle frasi."""
     rng = random.Random(perm_seed)
-    n_layers_plus_emb = 7  # emb + 6 layers per distilroberta-base
+    n_layers_plus_emb = 7
 
     preds_all = []
     cls_by_layer = [[] for _ in range(n_layers_plus_emb)]
@@ -166,7 +160,6 @@ def extract_features_and_preds(
 
 
 def compute_invariance_curve(feat: Dict[str, object]) -> List[float]:
-    """Centered Cosine Similarity tra x e perm(x) per ciascuno strato 0..6."""
     curve = []
     for l in range(len(feat["sent_x"])):
         vx = feat["sent_x"][l]
@@ -186,7 +179,6 @@ def run_linear_probe(
     device: torch.device,
     epochs: int = 80,
 ) -> float:
-    """Linear probe veloce su GPU per misurare cosa è leggibile linearmente a uno strato."""
     D = X_train.size(1)
     mean = X_train.mean(dim=0, keepdim=True)
     std = X_train.std(dim=0, keepdim=True).clamp(min=1e-5)
@@ -220,13 +212,9 @@ def run_model_stitching(
     hf_tok,
     device: torch.device,
     split_layer: int = 3,
-    adapt_epochs: int = 3,
+    adapt_epochs: int = 2,
     batch_size: int = 32,
 ) -> Dict[str, float]:
-    """
-    Innesto: primi `split_layer` strati di A -> (adattatore lineare opzionale) -> ultimi strati di B.
-    Usa forward hook su encoder.layer[split_layer - 1] per compatibilità totale con transformers.
-    """
     model_a.eval()
     model_b.eval()
     D = model_a.config.hidden_size
@@ -278,10 +266,8 @@ def run_model_stitching(
                 total += labels.size(0)
         return correct / max(total, 1)
 
-    # 1. Zero-shot stitching (Identity)
     zero_shot_acc = eval_stitched(nn.Identity().to(device), test_records)
 
-    # 2. Linear-adapted stitching (alleniamo solo adapter 768->768 su train_records)
     adapter = nn.Linear(D, D).to(device)
     nn.init.eye_(adapter.weight)
     nn.init.zeros_(adapter.bias)
@@ -342,9 +328,10 @@ def run_model_stitching(
 
 
 def make_plots(report: dict, out_dir: str):
-    # 1. Curva Invarianza Simbolica (Layer 0..6)
-    plt.figure(figsize=(8, 5))
     layers = list(range(7))
+
+    # 1. Curva Invarianza Simbolica
+    plt.figure(figsize=(8, 5))
     for name, curve in report["invariance_curves_id"].items():
         plt.plot(layers, curve, marker="o", linewidth=2, label=name)
     plt.axvline(x=3, color="gray", linestyle="--", alpha=0.6, label="Layer vincolato (L3)")
@@ -358,29 +345,34 @@ def make_plots(report: dict, out_dir: str):
     plt.savefig(os.path.join(out_dir, "invariance_curve.png"), dpi=180)
     plt.close()
 
-    # 2. CKA Diagonal Profile rispetto a 'free' e 'base_pretrained'
-    plt.figure(figsize=(8, 5))
+    # 2. CKA Diagonal Profile (confronti chiave vs free e base_pretrained)
+    plt.figure(figsize=(9, 5))
     for pair_name, cka_diag in report["cka_sentence_diag_id"].items():
-        plt.plot(layers, cka_diag, marker="s", linewidth=2, label=pair_name)
+        if (
+            pair_name.endswith("_vs_free")
+            or pair_name.startswith("free_vs_")
+            or pair_name.startswith("base_pretrained_vs_const")
+        ):
+            plt.plot(layers, cka_diag, marker="s", linewidth=2, label=pair_name)
     plt.axvline(x=3, color="gray", linestyle="--", alpha=0.6)
     plt.title("Linear CKA Strato-per-Strato (Rappresentazioni Frasi - Test ID)")
     plt.xlabel("Strato (0..6)")
     plt.ylabel("Linear CKA")
     plt.ylim(0.0, 1.05)
-    plt.legend()
+    plt.legend(fontsize=8)
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "cka_profiles.png"), dpi=180)
     plt.close()
 
-    # 3. Linear Probing per Classe e QDep
+    # 3. Linear Probing
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
     for name, curve in report["probe_cls_id"].items():
         axes[0].plot(layers, curve, marker="o", linewidth=2, label=name)
     axes[0].set_title("Linear Probe Accuracy: Classe (T/F/U) - Test ID")
     axes[0].set_xlabel("Strato (0..6)")
     axes[0].set_ylabel("Accuracy")
-    axes[0].legend()
+    axes[0].legend(fontsize=8)
     axes[0].grid(alpha=0.3)
 
     for name, curve in report["probe_qdep_ood"].items():
@@ -388,7 +380,7 @@ def make_plots(report: dict, out_dir: str):
     axes[1].set_title("Linear Probe Accuracy: Profondita Logica QDep (OOD)")
     axes[1].set_xlabel("Strato (0..6)")
     axes[1].set_ylabel("Accuracy")
-    axes[1].legend()
+    axes[1].legend(fontsize=8)
     axes[1].grid(alpha=0.3)
 
     plt.tight_layout()
@@ -413,7 +405,7 @@ def main():
     print("Modelli trovati:", ckpt_map)
     assert len(ckpt_map) >= 2, "Servono almeno 2 modelli allenati in --save_dir!"
 
-    analysis_dir = os.path.join(args.save_dir, f"analysis_seed{args.seed}")
+    analysis_dir = os.path.join(args.save_dir, f"analysis_all_seed{args.seed}")
     os.makedirs(analysis_dir, exist_ok=True)
 
     _, train_ds, val_ds, test_id_ds, test_ood_ds = load_or_build_datasets(
@@ -433,7 +425,6 @@ def main():
     dot_id = hf_tok.encode(".", add_special_tokens=False)[0]
     permutator = TextAlphaPermutator()
 
-    # Includiamo anche il modello base non allenato come riferimento!
     model_specs = {"base_pretrained": None}
     model_specs.update(ckpt_map)
 
@@ -457,7 +448,6 @@ def main():
                 m, nat_eval, hf_tok, permutator, dot_id, device, compute_perm=False
             )["preds"]
 
-    # 1. Curve di Invarianza Simbolica (layer 0..6)
     inv_curves_id = {
         name: compute_invariance_curve(feats_id[name]) for name in model_specs
     }
@@ -465,7 +455,6 @@ def main():
         name: compute_invariance_curve(feats_ood[name]) for name in model_specs
     }
 
-    # 2. CKA strato-per-strato (Sentence & CLS)
     trained_names = [k for k in model_specs if k != "base_pretrained"]
     pairs = []
     for idx_a in range(len(trained_names)):
@@ -491,7 +480,6 @@ def main():
             for l in range(7)
         ]
 
-    # 3. Disaccordo a coppie sulle predizioni
     disagreements = {}
     y_id = torch.tensor([LABEL_MAP[r["answer"]] for r in id_eval])
     y_ood = torch.tensor([LABEL_MAP[r["answer"]] for r in ood_eval])
@@ -516,7 +504,6 @@ def main():
                 }
             disagreements[f"{a}_vs_{b}"] = pair_res
 
-    # 4. Linear Probing per Strato (Classe su ID, QDep su OOD True/False)
     print("Esecuzione Linear Probing strato per strato...")
     probe_cls_id = {}
     probe_qdep_ood = {}
@@ -554,7 +541,6 @@ def main():
         probe_cls_id[name] = cls_curve
         probe_qdep_ood[name] = qdep_curve
 
-    # 5. Model Stitching (Layer 3 -> Layer 4..6)
     report = {
         "models": list(model_specs.keys()),
         "invariance_curves_id": inv_curves_id,
@@ -573,11 +559,10 @@ def main():
     make_plots(report, analysis_dir)
     print(f"Report parziale e grafici PNG salvati in: {analysis_dir}")
 
-    # 5. Model Stitching (Layer 3 -> Layer 4..6)
     print("Esecuzione Model Stitching (layer 3)...")
     stitching = {}
-    stitch_train = train_ds.records[:1000]
-    stitch_test = test_id_ds.records[:600]
+    stitch_train = train_ds.records[:1200]
+    stitch_test = test_id_ds.records[:800]
     for a in trained_names:
         for b in trained_names:
             if a == b:
@@ -604,10 +589,10 @@ def main():
         print(f"  {k:16s}: {[round(x, 3) for x in v]}")
     print("\nCKA Frasi ID (L0..L6):")
     for k, v in cka_sent_id.items():
-        print(f"  {k:28s}: {[round(x, 3) for x in v]}")
+        print(f"  {k:34s}: {[round(x, 3) for x in v]}")
     print("\nModel Stitching (Layer 3):")
     for k, v in stitching.items():
-        print(f"  {k:24s}: {v}")
+        print(f"  {k:30s}: {v}")
     print(f"\nReport completo salvato in: {analysis_dir}")
 
 
